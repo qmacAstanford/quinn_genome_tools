@@ -6,19 +6,26 @@ optimum_window.
 
 Example:
     Compair my.bed1 to my.bed2 ::
-        bed_handler2.split("my.bed1", "my_dir1/")
-        bed_handler2.bed_to_bin_dir("my_dir1/")
-        bed_handler2.split("my.bed2", "my_dir2/")
-        bed_handler2.bed_to_bin_dir("my_dir2/")
-        bed_handler2.optimum_window(dir1="my_dir1/", dir2="my_dir2/",
+        bin_tools.split("my.bed1", "my_dir1/")
+        bin_tools.bed_to_bin_dir("my_dir1/")
+        bin_tools.split("my.bed2", "my_dir2/")
+        bin_tools.bed_to_bin_dir("my_dir2/")
+        bin_tools.optimum_window(dir1="my_dir1/", dir2="my_dir2/",
                             precut_frac1=0.5, outprefix="my_output",
                             cutoff2=0.5)
+
+    Alturnatively ::
+        bin_tools.optimum_window("../LADs/meth_Nhfl/", "../LADs/LAD_chroms/", "NHLF_LAD_Data")
+        bin_tools.plot_optimum("./NHLF_LAD_Data")
+
 """
 
 import numpy as np
 from multiprocessing import Pool
 import pickle
 import math
+from multiprocessing import Pool, Array, Process
+from scipy import stats
 hg19_chrom_lengths={
     "chr1":249250621
    , "chr2":243199373
@@ -51,7 +58,7 @@ total_bins_chr19=0
 """int: total length of hg19 in bins"""
 file_bin_width=200
 """int: length of hg19 in bins
-I typically use 200bp bins corrisponding to nucleosomes 
+I typically use 200bp bins corrisponding to nucleosomes
 """
 def veclen(length):
     return int(np.ceil(length/file_bin_width))
@@ -60,7 +67,67 @@ for chromosome, chr_end in hg19_chrom_lengths.items():
     total_bins_chr19 += veclen(chr_end)
 windows_default = np.unique((10**np.linspace(0.2,5.2,100)).astype(int))-1
 
-from multiprocessing import Pool, Array, Process
+
+chromosome_numbers = {
+     "chr1":1
+   , "chr2":2
+   , "chr3":3
+   , "chr4":4
+   , "chr5":5
+   , "chr6":6
+   , "chr7":7
+   , "chr8":8
+   , "chr9":9
+   , "chr10":10
+   , "chr11":11
+   , "chr12":12
+   , "chr13":13
+   , "chr14":14
+   , "chr15":15
+   , "chr16":16
+   , "chr17":17
+   , "chr18":18
+   , "chr19":19
+   , "chr20":20
+   , "chr21":21
+   , "chr22":22
+   , "chrX":23
+   , "chrY":24}
+def invert_dict(x):
+    return {value: key for key, value in x.items()}
+chromosome_names = invert_dict(chromosome_numbers)
+
+class genomic_locations:
+    # in constructor create Array for chrom, loc, and val
+    def __init__(self, fileName):
+        loc = []
+        with open(fileName,"r") as fl:
+            for line in fl.readlines():
+                vals = line.split()
+                loc.append((chromosome_numbers[vals[0]],
+                            int( (int(vals[1]) + int(vals[2]))/2 ),
+                            float(vals[3]) ))
+        loc.sort() # Mokes data retreaval more efficent
+        self.npts = len(loc)
+        self.chroms = Array('i', self.npts, lock=False)
+        self.loc = Array('i', self.npts, lock=False)
+        self.values = Array('d', self.npts, lock=False)
+        for ii in range(self.npts):
+            self.chroms[ii] = loc[ii][0]
+            self.loc[ii] = loc[ii][1]
+            self.values[ii] = loc[ii][2]
+
+    def __getitem__(self, key):
+        return [self.chroms[key], self.loc[key], self.values[key]]
+
+    def __setitem__(self, key, value):
+        self.values[key] = value
+
+    def __len__(self):
+        return self.npts
+
+
+
 class genomic_vector:
     """Genomic information stored in memory.
     """
@@ -83,12 +150,14 @@ class genomic_vector:
         self.max_median=None
         self.total_length = 0
         first_chr=True
+        self.mean = 0
         for chromosome, chr_end in hg19_chrom_lengths.items():
             values = self.get_chromosome(chromosome)
             self.total_length+=len(values)
             median=np.median(values)
             minimum=np.amin(values)
             maximum=np.amax(values)
+            self.mean += np.sum(values)
             if first_chr:
                 first_chr=False
                 self.minimum=minimum
@@ -98,8 +167,10 @@ class genomic_vector:
                 self.minimum=min(self.minimum,minimum)
                 self.maximum=max(self.maximum,maximum)
                 self.max_median=max(self.max_median, median)
+        self.mean = self.mean/self.total_length
         self.stats={"min":self.minimum, "max":self.maximum,
-            "max_median":self.max_median, "total_length":self.total_length}
+                    "max_median":self.max_median, "total_length":self.total_length,
+                    "mean":self.mean}
         return self.stats
 
     def chrom_pointer(self, chromosome):
@@ -112,10 +183,19 @@ class genomic_vector:
         out[:] = self.shared_chroms[ii][:]
         return out
 
-    def get_processed_vector(self, chromosome, half_width=0, cutoff=None, cutoff_after=None):
+    def apply_filter(self, args):
+        for chromosome, chr_end in hg19_chrom_lengths.items():
+            self.chrom_names.append(chromosome)
+            ii = self.chrom_index[chromosome]
+            self.shared_chroms[ii]=self.get_processed_vector(chromosome,
+                                                             **args)
+        self.get_chrom_stats()
+
+    def get_processed_vector(self, chromosome, half_width=0, cutoff=None,
+                             cutoff_as_prob_of_1=False, cutoff_after=None):
         """Load data file and apply cutoff(s) and filter.
         Input file expected to have a single number per line.
-    
+
         Args:
             chromosome (str): Which chromosome to precess
             half_width (int): The half-width of the window average to apply.
@@ -124,7 +204,10 @@ class genomic_vector:
         """
         out = self.get_chromosome(chromosome)
         if type(cutoff) != type(None):
-            out = (out>cutoff).astype(int)
+            if cutoff_as_prob_of_1:
+                out = np.minimum(out,cutoff)/cutoff
+            else:
+                out = (out>cutoff).astype(int)
         if half_width>0:
             out = fastSquareFilter(out,
                                   halfWidth=half_width)
@@ -150,8 +233,8 @@ def make_fake_data(width=500):
                 set1[ii]=1-set1[ii]
         np.savetxt("fake_dir1/"+chromosome+"_bins",set1, fmt='%.3f')
         np.savetxt("fake_dir2/"+chromosome+"_bins",set2, fmt='%.3f')
-        
-        
+
+
 
 # ---------------------------------------------------------------
 #         File processing
@@ -332,14 +415,42 @@ def cut(data, upper_fraction=0.5, number_of_bins=1000, cut_val=False):
 
 
 # ------------------------------------------------------------------
-#      Loading/using bind chromosome files
+#      Loading/using binned chromosome files
 # ------------------------------------------------------------------
 
+
+def get_window_average_at(chip_set, half_width, chroms, locs, npts):
+    """Return chip_set averaged over half_width at specified locations.
+
+    Args:
+        chip_set (genomic_vector): genomic data to be windows averaged.
+        half_width (int): half widith of window average to be perfomed
+        chroms (Array): List in ints corrisponding to chromosomes
+        locs (Array): List of int genomic positions
+        npts (int): length of arrays chroms and locs
+    """
+    smoothed = {}
+    for chromosome, chr_num in chromosome_numbers.items():
+        smoothed[chr_num] = chip_set.get_processed_vector(chromosome,
+                                                          half_width)
+    out = np.zeros(npts)
+    for ii in range(npts):
+        try:
+            out[ii] = smoothed[chroms[ii]][ locs[ii]//file_bin_width ]
+        except:
+            print("Tried to access %d of chr%d, only goes to %d"%(
+                   locs[ii]//file_bin_width, chroms[ii],
+                   len(smoothed[chroms[ii]])))
+            import pdb
+            pdb.set_trace()
+            pass
+    return out
 
 def dot_product(set1='', set2='', chromosome='chr1',
                 half_width1=0,
                 half_width2=0, cutoff1=None, cutoff2=None, cutoff_after1=None,
-                cutoff_after2=None, binary_predict=False):
+                cutoff_after2=None, binary_predict=False,
+                precut1_as_prob=False, precut2_as_prob=False):
     """Calculate the product of 2 different genomic data sets.
     This can be used in correlating one data set to another.
     Cutoffs and window averaging can be applied to either data set.
@@ -357,9 +468,11 @@ def dot_product(set1='', set2='', chromosome='chr1',
     """
     #print("Working on "+chromosome+" half_width1="+str(half_width1))
     f1 = set1.get_processed_vector(chromosome, half_width=half_width1,
-                              cutoff=cutoff1, cutoff_after=cutoff_after1)
+                                   cutoff=cutoff1, cutoff_after=cutoff_after1,
+                                   cutoff_as_prob_of_1 = precut1_as_prob)
     f2 = set2.get_processed_vector(chromosome, half_width=half_width2,
-                              cutoff=cutoff2, cutoff_after=cutoff_after2)
+                                   cutoff=cutoff2, cutoff_after=cutoff_after2,
+                                   cutoff_as_prob_of_1 = precut2_as_prob)
     if binary_predict:
         return np.dot(f1,f2)+np.dot(1-f1,1-f2)
     return np.dot(f1, f2)
@@ -404,20 +517,19 @@ def post_bin_histogram(set1='', bins=[0.0,0.5,1.0], chromosome='chr1',
                        half_width1=0, pre_cutoff=None):
     """Histogram values after applied window.
     Assumes directory format created by bed_to_bin_dir.
-    
+
     Args:
         directory (str): Name of directory containing input files
         bins (ndarray): array of bin edges
         chromosome (str): Chromosome name
         half_width1 (int): Half width of window averaging
         pre_cutoff (float):  Apply this cutoff before windowing
-    """  
+    """
     f1 = set1.get_processed_vector(chromosome, half_width1,
                               cutoff=pre_cutoff)
     hist = np.histogram(f1,bins)[0]
     return hist
-def post_bin_histogram_wrapper(args):
-    return post_bin_histogram(**args)
+
 def post_bin_hist_all_chr(args):
     total = np.zeros(len(args["bins"])-1)
     for chromosome, chr_end in hg19_chrom_lengths.items():
@@ -468,10 +580,10 @@ def make_2D_hist_all_chromosomes(args):
     """
     Example:
         Compair my.bed to a similarly processed data set ::
-            bed_handler2.split("my.bed", "my_dir/")
-            bed_handler2.bed_to_bin_dir("my_dir/")
+            bin_tools.split("my.bed", "my_dir/")
+            bin_tools.bed_to_bin_dir("my_dir/")
             args={"dir_x":"my_dir/", "dir_y":"other_dir/"}
-            outputs = bed_handler2.make_2D_hist_all_chromosomes(args)
+            outputs = bin_tools.make_2D_hist_all_chromosomes(args)
     """
     # generate bins
     nbins=100
@@ -506,7 +618,7 @@ def make_2D_hist_wrapper(args):
 def winlist2cut(winlist, bins, upper_fraction=0.5, use_hg19_length=True):
     cutoffs = []
 
-    for hists in winlist: 
+    for hists in winlist:
         if use_hg19_length:
             cum_f = cumulent(hists)/total_bins_chr19
         else:
@@ -516,7 +628,12 @@ def winlist2cut(winlist, bins, upper_fraction=0.5, use_hg19_length=True):
     return cutoffs
 
 def mark_prob_cutoff(hist, bins, mark_frac=0.5):
-    """Cutoff such that if 
+    """Cutoff such that when given to bins_to_prob the average
+    probability is mark_frac.
+
+    hist (ndarray): histogram values of data
+    bins (ndarray): edges of histogram bins (len(bins) = len(hist) + 1
+    mark_frac (float): overall fraction marked (e.g. avj. prob.)
     """
     centers = 0.5*(bins[1:]+bins[:-1])
     prev_frac_un_marked = 0.0
@@ -568,13 +685,19 @@ def plot_window_histograms(pickle_name, skip=1, title=None, maxWindow=None,
     plt.xlabel("Chi-seq Singnal")
     plt.ylabel("Count")
     plt.show()
-        
+
 # --------------------------------------------------
 #     Multi-processing tools
 # -----------------------------------------------
 
-def run_muliWindow(args, function, cutoff_after1_by_window=None):
-    """use mulitprossing to run conditons"""
+def run_multiWindow(args, function, cutoff_after1_by_window=None):
+    """Use mulitprossing to run function with different windows.
+
+    Args:
+        args (dict): Passed on to function
+        function (callable): Of form function(half_widt1=..., **args)
+        cutoff_after1_by_window (list): list of cutoff_after's to also pass
+    """
     invals=[]
     for i_win, half_width1 in enumerate(windows_default):
         my_args=args.copy()
@@ -612,11 +735,90 @@ def plot_optimum(pickle_name, title=None, logy=False):
     plt.ylabel("predition accuracy")
     plt.show()
 
+# ------------------------------------------
+#    Procedures
+# ------------------------------------------
 
-def optimum_window(dir1='', dir2='', precut1=None, precut_frac1=None,
+def raw_optimum_window(chip_dir, LAD_file, pickle_name='window_data',
+                       fraction_marked=0.5):
+    set1 = genomic_vector(chip_dir) # Chip-seq
+    Chip_cutoff = get_all_chromosome_cut(set1, upper_fraction=fraction_marked)
+    set1.apply_filter({"cutoff":Chip_cutoff})
+    fraction_actual = set1.mean
+    print("Fraction marked with Chip: %f ..."%(fraction_actual))
+
+    my_locs = genomic_locations(LAD_file)
+
+    def my_correlation(half_width):
+        chip_vals = get_window_average_at(set1, half_width, my_locs.chroms, my_locs.loc,
+                          len(my_locs))
+        return list(stats.pearsonr( chip_vals, my_locs.values ))
+
+    with Pool(31) as my_pool:
+        output = my_pool.map(my_correlation, windows_default)
+    output = np.array(output)
+    pearson_r = output[:,0]
+    p_values = output[:,1]
+
+    data={"chip_dir":chip_dir, "LAD_file":LAD_file, "windows_default":windows_default,
+          "fraction_marked":fraction_marked, "correlation":pearson_r,
+          "p_values":p_values}
+    pickle.dump(data, open(pickle_name,"wb"))
+
+
+
+def optimum_window(dir1, dir2, pickle_name='window_data'):
+    set1 = genomic_vector(dir1) # Chip-seq
+    set2 = genomic_vector(dir2) # LADs
+
+    # LAD data is eithor 0 or some large number >> 0.5
+    # Here we make it 0 or 1
+    set2.apply_filter({"cutoff":0.5})
+    fraction_LAD = set2.mean
+    print("Fraction LAD %f ..."%(fraction_LAD))
+
+    # --- Calculate approximate cut and limits for binning ---
+    print("Calculating stats about dir1")
+    nbins=400
+    bins=np.linspace(set1.minimum,
+                         min(set1.maximum,set1.max_median*5.0),
+                         nbins+1)
+
+    # Bin Chip seq values
+    hist = np.zeros(len(bins)-1)
+    for chromosome, chr_end in hg19_chrom_lengths.items():
+        f1 = set1.get_chromosome(chromosome)
+        hist += np.histogram(f1,bins)[0]
+
+    # Calculate the cutoff for the chip seq so that
+    # the mean probability equals that of the
+    print("Calculating chip_cut ...")
+    chip_cut = mark_prob_cutoff(hist, bins, mark_frac=fraction_LAD)
+    print("Appling chip_cut of %f ..."%(chip_cut))
+    set1.apply_filter({"cutoff":chip_cut, "cutoff_as_prob_of_1":True})
+    print("set1 mean=%f"%(set1.mean))
+
+    # --- calculate prediction ---
+    print("Calculating predition")
+    args={"set1":set1, "set2":set2, "binary_predict":True}
+    dot_products = run_multiWindow(args, all_chromosome_dot)
+    dot_products = np.array(dot_products)/total_bins_chr19 # Normalize
+
+    # --- save data ---
+    data={"dir1":dir1, "dir2":dir2,"windows_default":windows_default,
+          "dot_products":dot_products,
+          "dir1_stats":set1.stats, "dir2_stats":set2.stats,
+          "chip_cut":chip_cut, "fraction_LAD": fraction_LAD}
+
+    pickle.dump(data, open(pickle_name,"wb"))
+
+
+
+def old_optimum_window(dir1='', dir2='', precut1=None, precut_frac1=None,
                    outprefix='',
                    upper_fraction2=None, cutoff2=0.5):
-    """Calculates how predictive dir1 is of dir2 for various values of
+    """This was my attempt at a general algorithm.  Too many options.
+    Calculates how predictive dir1 is of dir2 for various values of
     window averaging over dir1.  Output is pickled.
 
     Args:
@@ -630,10 +832,10 @@ def optimum_window(dir1='', dir2='', precut1=None, precut_frac1=None,
     set1 = genomic_vector(dir1)
     set2 = genomic_vector(dir2)
     # --- Test input and calculate missing values ---
-    if (type(upper_fraction2) != type(None) 
+    if (type(upper_fraction2) != type(None)
         and type(cutoff2) != type(None)):
         raise ValueError("Only specify upper_fraction2 or cutoff2")
-    if (type(upper_fraction2) == type(None) 
+    if (type(upper_fraction2) == type(None)
         and type(cutoff2) == type(None)):
         raise ValueError("You must specify upper_fraction2 or cutoff2")
     if type(upper_fraction2) == type(None):
@@ -666,14 +868,14 @@ def optimum_window(dir1='', dir2='', precut1=None, precut_frac1=None,
     # --- Bin post window dir1 to determine cutoff at each window ---
     print("Making histograms for each windowsize")
     args={"set1":set1, "bins":bins, "pre_cutoff":precut1}
-    winlist = run_muliWindow(args, function=post_bin_hist_all_chr)
+    winlist = run_multiWindow(args, function=post_bin_hist_all_chr)
     post_window_cutoffs = winlist2cut(winlist, bins, upper_fraction=upper_fraction2)
-    
-    # --- calculate prediction   
+
+    # --- calculate prediction
     print("Calculating predition")
     args={"set1":set1, "set2":set2, "cutoff2":cutoff2, "cutoff1":precut1,
           "binary_predict":True}
-    dot_products = run_muliWindow(args, all_chromosome_dot, cutoff_after1_by_window=post_window_cutoffs)
+    dot_products = run_multiWindow(args, all_chromosome_dot, cutoff_after1_by_window=post_window_cutoffs)
     dot_products = np.array(dot_products)/(total_bins_chr19) # Normalize
 
     import inspect
@@ -735,7 +937,7 @@ def get_limits_chrom_vecs_depreciated(directory):
 def run_muliconditons(args, outname='dot_output', function=dot_wrapper,
                       cutoff_after1_by_window=None):
     """use mulitprossing to run conditons"""
-    if __name__ == 'bed_handler2':
+    if __name__ == 'bin_tools':
         invals=[]
         for chromosome, chr_end in hg19_chrom_lengths.items():
             for i_win, half_width1 in enumerate(windows_default):
