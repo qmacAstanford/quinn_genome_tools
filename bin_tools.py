@@ -739,6 +739,55 @@ def plot_optimum(pickle_name, title=None, logy=False):
 #    Procedures
 # ------------------------------------------
 
+chip_dirs = {
+    '../LADs/meth_AGO4450/':'AG_H3K9me3',
+    '../LADs/meth_Nhfl/':'Nhlf_H3K9me3',
+    '../h3K9me3_chroms_IMR90_hg19/':'IMR90_H3K9me3'}
+LAD_files = {}
+for ii in range(1,9):
+    LAD_files['../../LAD_data/LAD_DATA'+str(ii)]='DamID'+str(ii)
+
+def run_data_sets():
+    for chip_dir, chip_name in chip_dirs.items():
+        for LAD_file, LAD_name in LAD_files.items():
+            name = chip_name+'vs'+LAD_name
+            print("running "+name+" ...")
+            raw_optimum_window(chip_dir, LAD_file, pickle_name=name,
+                               fraction_marked=0.5)
+
+def plot_optimum_window_data():
+    from matplotlib import pyplot as plt
+    import seaborn as sns
+
+    ii = 0
+    for chip_dir, chip_name in chip_dirs.items():
+        chip_label = chip_name
+        color = sns.color_palette('deep',len(chip_dirs))[ii]
+        ii = ii+1
+        for LAD_file, LAD_name in LAD_files.items():
+            name = chip_name+'vs'+LAD_name
+            data = pickle.load(open(name,"rb"))
+            plt.semilogx(data['windows_default']*file_bin_width, data['correlation'],
+                         label=chip_label, color=color)
+            chip_label=None
+
+    plt.legend()
+    plt.title('DamID vs windowed ChIP-seq correlation')
+    plt.xlabel('ChIP-seq Window Half Width (bp)')
+    plt.ylabel('Correlation')
+    plt.show()
+
+
+
+shared_data = {}
+
+def my_correlation(half_width):
+    my_locs = shared_data['my_locs']
+    set1 = shared_data['set1']
+    chip_vals = get_window_average_at(set1, half_width, my_locs.chroms, my_locs.loc,
+                      len(my_locs))
+    return list(stats.pearsonr( chip_vals, my_locs.values ))
+
 def raw_optimum_window(chip_dir, LAD_file, pickle_name='window_data',
                        fraction_marked=0.5):
     set1 = genomic_vector(chip_dir) # Chip-seq
@@ -749,10 +798,13 @@ def raw_optimum_window(chip_dir, LAD_file, pickle_name='window_data',
 
     my_locs = genomic_locations(LAD_file)
 
-    def my_correlation(half_width):
-        chip_vals = get_window_average_at(set1, half_width, my_locs.chroms, my_locs.loc,
-                          len(my_locs))
-        return list(stats.pearsonr( chip_vals, my_locs.values ))
+
+    shared_data['my_locs'] = my_locs
+    shared_data['set1'] = set1
+    #all_args = []
+    #for half_width in windows_default:
+    #    all_args.append( {'half_width':half_width, 'my_locs':my_locs,
+    #                      'set1':set1} )
 
     with Pool(31) as my_pool:
         output = my_pool.map(my_correlation, windows_default)
@@ -765,6 +817,66 @@ def raw_optimum_window(chip_dir, LAD_file, pickle_name='window_data',
           "p_values":p_values}
     pickle.dump(data, open(pickle_name,"wb"))
 
+def chip_DamID_histogram(half_width):
+    my_locs = shared_data['my_locs']
+    set1 = shared_data['set1']
+    chip_vals = get_window_average_at(set1, half_width, my_locs.chroms, my_locs.loc,
+                                      len(my_locs))
+    chip_bins = np.linspace(0.0,1.0,21)
+    DamID_bins = np.linspace(-8.0, 8.0, 65)
+
+    twoD_hist = np.histogram2d(chip_vals, my_locs.values,
+                               bins=[chip_bins, DamID_bins])
+    return twoD_hist
+
+def run_chip_DamID_histogram(fraction_marked=0.5,
+                             LAD_file='../../LAD_data/LAD_DATA1'):
+    my_locs = genomic_locations(LAD_file)
+    shared_data['my_locs'] = my_locs
+
+    for chip_dir, chip_name in chip_dirs.items():
+        set1 = genomic_vector(chip_dir) # Chip-seq
+        Chip_cutoff = get_all_chromosome_cut(set1, upper_fraction=fraction_marked)
+        set1.apply_filter({"cutoff":Chip_cutoff})
+        fraction_actual = set1.mean
+        shared_data['set1'] = set1
+
+        half_widths = [0, 103, 4839]
+        with Pool(31) as my_pool:
+            output = my_pool.map(chip_DamID_histogram, half_widths)
+
+        for ii, half_width in enumerate(half_widths):
+            name = 'hist2D_'+chip_name+'_'+str(half_width)
+            data={"count":output[ii][0], "chip_edges":output[ii][1],
+                  "DamID_edges":output[ii][2], "LAD_file":LAD_file,
+                  "chip_dir":chip_dir, "half_width":half_width,
+                  "fraction_marked":fraction_marked}
+            pickle.dump(data, open(name,"wb"))
+
+def plot_2D_histogram():
+    from matplotlib.image import NonUniformImage
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    for chip_dir, chip_name in chip_dirs.items():
+        half_widths = [0, 103, 4839]
+        for ii, half_width in enumerate(half_widths):
+            name = 'hist2D_'+chip_name+'_'+str(half_width)
+            data = pickle.load(open(name,"rb"))
+            extent = [data['chip_edges'][0], data['chip_edges'][-1],
+                      data['DamID_edges'][0], data['DamID_edges'][-1]]
+            print(extent)
+            plt.imshow(data['count'].transpose(), interpolation='nearest', origin='low',
+                       extent = extent, aspect='auto',
+                       cmap=sns.cubehelix_palette(light=1, as_cmap=True))
+            plt.title(chip_name+', Half Width=%5.2e bp'%(data['half_width']*200))
+            plt.xlabel('ChIP-seq')
+            plt.ylabel('log2 DamID enrichment')
+            plt.ylim((-4,4))
+            plt.show()
+            #im = NonUniformImage(interpolation='bilinear')
+            #xcenters = (data['chip_edges'][:-1] + data['chip_edges'][1:] )/2
+            #ycenters = (data['DamID_edges'][:-1] + data['DamID_edges'][1:] )/2
+            #im.set_data(xcenters, ycenters, data['count'])
 
 
 def optimum_window(dir1, dir2, pickle_name='window_data'):
