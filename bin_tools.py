@@ -67,6 +67,20 @@ for chromosome, chr_end in hg19_chrom_lengths.items():
     total_bins_chr19 += veclen(chr_end)
 windows_default = np.unique((10**np.linspace(0.2,5.2,100)).astype(int))-1
 
+# curl -s "http://hgdownload.cse.ucsc.edu/goldenPath/hg189/database/cytoBand.txt.gz" | gunzip -c | grep acen
+def get_centromeres(filename = "../../centromereshg19"):
+    """load {centromere: [start centromere bin, end centromere bin]}
+    """
+    out = {}
+    with open(filename) as fl:
+        for line in fl.readlines():
+            temp = line.split()
+            if temp[0] in out.keys():
+                out[temp[0]][1] = veclen(int(temp[2]))
+            else:
+                out[temp[0]] = [veclen(int(temp[1])), 0]
+    return out
+centromeres = get_centromeres()
 
 chromosome_numbers = {
      "chr1":1
@@ -101,13 +115,22 @@ class genomic_locations:
     # in constructor create Array for chrom, loc, and val
     def __init__(self, fileName):
         loc = []
-        with open(fileName,"r") as fl:
-            for line in fl.readlines():
-                vals = line.split()
-                loc.append((chromosome_numbers[vals[0]],
-                            int( (int(vals[1]) + int(vals[2]))/2 ),
-                            float(vals[3]) ))
-        loc.sort() # Mokes data retreaval more efficent
+        if isinstance(fileName, list):
+            for fn in fileName:
+                with open(fn,"r") as fl:
+                    for line in fl.readlines():
+                        vals = line.split()
+                        loc.append((chromosome_numbers[vals[0]],
+                                    int( (int(vals[1]) + int(vals[2]))/2 ),
+                                    float(vals[3]) ))
+        else:
+            with open(fileName,"r") as fl:
+                for line in fl.readlines():
+                    vals = line.split()
+                    loc.append((chromosome_numbers[vals[0]],
+                                int( (int(vals[1]) + int(vals[2]))/2 ),
+                                float(vals[3]) ))
+        loc.sort() # Makes data retreaval more efficent
         self.npts = len(loc)
         self.chroms = Array('i', self.npts, lock=False)
         self.loc = Array('i', self.npts, lock=False)
@@ -126,6 +149,23 @@ class genomic_locations:
     def __len__(self):
         return self.npts
 
+    def average(self):
+        """Average by chromosome in format {'chr1':1.2, ...}
+        """
+        sum_by_chr = {}
+        for chromosome_number in chromosome_names.keys():
+            sum_by_chr[chromosome_number] = [0.0, 0]
+            # example {'1': [0.0, 0] ...} where list is [total, count]
+        for ii in range(self.npts):
+            chromosome_number = self.chroms[ii]
+            sum_by_chr[chromosome_number][0] += self.values[ii]
+            sum_by_chr[chromosome_number][1] += 1
+        out = {}
+        for chromosome_number, value in sum_by_chr.items():
+            if value[1] == 0:
+                continue
+            out[chromosome_names[chromosome_number]] = value[0]/value[1]
+        return out
 
 
 class genomic_vector:
@@ -182,6 +222,17 @@ class genomic_vector:
         ii = self.chrom_index[chromosome]
         out[:] = self.shared_chroms[ii][:]
         return out
+
+    def get_chromosome_average(self, chromosome, exclude_centromere=False):
+        ii = self.chrom_index[chromosome]
+        if exclude_centromere:
+            centro = centromeres[chromosome]
+            total = sum(self.shared_chroms[ii][0:centro[0]])
+            total += sum(self.shared_chroms[ii][centro[1]:-1])
+            length = veclen(hg19_chrom_lengths[chromosome]) - (centro[1] - centro[0])
+            return total/length
+        total = sum(self.shared_chroms[ii])
+        return total/veclen(hg19_chrom_lengths[chromosome])
 
     def apply_filter(self, args):
         for chromosome, chr_end in hg19_chrom_lengths.items():
@@ -748,12 +799,11 @@ for ii in range(1,9):
     LAD_files['../../LAD_data/LAD_DATA'+str(ii)]='DamID'+str(ii)
 
 def run_data_sets():
+    my_locs = genomic_locations(list(LAD_files.keys()))
     for chip_dir, chip_name in chip_dirs.items():
-        for LAD_file, LAD_name in LAD_files.items():
-            name = chip_name+'vs'+LAD_name
-            print("running "+name+" ...")
-            raw_optimum_window(chip_dir, LAD_file, pickle_name=name,
-                               fraction_marked=0.5)
+        name = chip_name+'vs_DamID'
+        raw_optimum_window(chip_dir, 'all', pickle_name=name,
+                           fraction_marked=0.5, my_locs=my_locs)
 
 def plot_optimum_window_data():
     from matplotlib import pyplot as plt
@@ -764,12 +814,11 @@ def plot_optimum_window_data():
         chip_label = chip_name
         color = sns.color_palette('deep',len(chip_dirs))[ii]
         ii = ii+1
-        for LAD_file, LAD_name in LAD_files.items():
-            name = chip_name+'vs'+LAD_name
-            data = pickle.load(open(name,"rb"))
-            plt.semilogx(data['windows_default']*file_bin_width, data['correlation'],
-                         label=chip_label, color=color)
-            chip_label=None
+        name = chip_name+'vs_DamID'
+        data = pickle.load(open(name,"rb"))
+        plt.semilogx(data['windows_default']*file_bin_width, data['correlation'],
+                     label=chip_label, color=color)
+        chip_label=None
 
     plt.legend()
     plt.title('DamID vs windowed ChIP-seq correlation')
@@ -789,14 +838,15 @@ def my_correlation(half_width):
     return list(stats.pearsonr( chip_vals, my_locs.values ))
 
 def raw_optimum_window(chip_dir, LAD_file, pickle_name='window_data',
-                       fraction_marked=0.5):
+                       fraction_marked=0.5, my_locs=None):
     set1 = genomic_vector(chip_dir) # Chip-seq
     Chip_cutoff = get_all_chromosome_cut(set1, upper_fraction=fraction_marked)
     set1.apply_filter({"cutoff":Chip_cutoff})
     fraction_actual = set1.mean
     print("Fraction marked with Chip: %f ..."%(fraction_actual))
 
-    my_locs = genomic_locations(LAD_file)
+    if my_locs is None:
+        my_locs = genomic_locations(LAD_file)
 
 
     shared_data['my_locs'] = my_locs
@@ -925,6 +975,56 @@ def optimum_window(dir1, dir2, pickle_name='window_data'):
     pickle.dump(data, open(pickle_name,"wb"))
 
 
+def chip_mean_by_chromosome(my_chip_dirs=chip_dirs, fraction_marked=0.5):
+    """
+    Args:
+        my_chip_dirs (dict): example {"../path/to/meth_Nhfl/':'Nhlf_H3K9me3'}
+
+    Returns:
+        Dictionary of dictionaries for format data['chip_name']['chr1'] = avj
+        chip content.
+    """
+    data = {}
+    for chip_dir, chip_name in my_chip_dirs.items():
+        set1 = genomic_vector(chip_dir) # Chip-seq
+        Chip_cutoff = get_all_chromosome_cut(set1, upper_fraction=fraction_marked)
+        set1.apply_filter({"cutoff":Chip_cutoff})
+        fraction_actual = set1.mean
+
+        chip_average = {}
+        for chromosome, chr_end in hg19_chrom_lengths.items():
+            chip_average[chromosome] = set1.get_chromosome_average(chromosome,
+                                                        exclude_centromere=True)
+        data[chip_name] = chip_average
+    return data
+def DamID_by_chromosome():
+    """
+    """
+    my_locs = genomic_locations(list(LAD_files.keys()))
+    return my_locs.average()
+def plot_damID_vs_Chip(damID_data, chip_datas):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    ii = 0
+    colors = sns.color_palette('deep', len(chip_datas))
+    for cell_type, chip_data in chip_datas.items():
+        label = cell_type
+        color = colors[ii]
+        ii +=1
+        for chromosome, chip_value in chip_data.items():
+            if chromosome not in damID_data.keys():
+                print(chromosome)
+                continue
+            y = damID_data[chromosome]
+            x = chip_value
+            print([x,y])
+            plt.plot(x,y,'o',color=color, label=label)
+            plt.text(x,y+0.006,chromosome[3:], color=color, fontsize='8')
+            label = None
+    plt.xlabel('Mean H3K9me3 ChIP')
+    plt.ylabel('Mean log2 DamID enrichment')
+    plt.legend()
+    plt.show()
 
 def old_optimum_window(dir1='', dir2='', precut1=None, precut_frac1=None,
                    outprefix='',
